@@ -1,0 +1,16 @@
+[
+    {
+        "order_id": 1,
+        "customer_name": "Youness Khayour",
+        "product": "Laptops",
+        "quantity": 6,
+        "order_status": "In Progress"
+    },
+    {
+        "order_id": 2,
+        "customer_name": "Youness Khayour",
+        "product": "Boat",
+        "quantity": 8,
+        "order_status": "In Progress"
+    }
+]

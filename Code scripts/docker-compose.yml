@@ -1,0 +1,307 @@
+
+####  ------- FINAL PROJECT --------  ####
+
+# Pipeline for Real-time Straming of Change Data Captures (CDC) 
+
+# --------
+#  DOCKER
+# -------
+version: '3.8'
+
+services:
+
+  # PostgreSQL Database with Debezium for CDC (Change Data Capture)
+  db_service:
+    image: debezium/postgres:13
+    container_name: pg_cdc_instance
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: db
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5433:5432"
+    networks:
+      - data_pipeline_net
+    volumes:
+      - postgres_storage:/var/lib/postgresql/data
+      - ./postgres_config/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgres_config:/etc/postgresql/postgresql.conf:ro
+      - ./postgres_config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    user: postgres:postgres
+
+  # Zookeeper for Kafka coordination
+  zookeeper_service:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zk_instance
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 5
+      ZOOKEEPER_INIT_LIMIT: 10
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 60
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: '*'
+      ZOOKEEPER_ADMIN_ENABLE_SERVER: 'false'
+      ZOOKEEPER_SERVER_ID: 1
+      ZOOKEEPER_CLIENT_PORT_ADDRESS: 0.0.0.0
+    volumes:
+      - zookeeper_storage:/var/lib/zookeeper/data
+      - zk_logs:/var/lib/zookeeper/log
+    networks:
+      - data_pipeline_net
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka Broker 1
+  kafka_broker1:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka_primary
+    restart: unless-stopped
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper_service:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_primary:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+    volumes:
+      - kafka_primary_storage:/var/lib/kafka/data
+    depends_on:
+      - zookeeper_service
+    networks:
+      - data_pipeline_net
+
+  # Kafka Broker 2 for redundancy
+  kafka_broker2:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka_secondary
+    restart: unless-stopped
+    ports:
+      - "29093:29093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper_service:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_secondary:9092,EXTERNAL://localhost:29093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:29093
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+    volumes:
+      - kafka_secondary_storage:/var/lib/kafka/data
+    depends_on:
+      - zookeeper_service
+    networks:
+      - data_pipeline_net
+
+  # Kafka Connect for integrating PostgreSQL changes into Kafka topics
+  kafka_connect:
+    image: confluentinc/cp-kafka-connect:7.4.0
+    container_name: kafka_connect_instance
+    restart: unless-stopped
+    ports:
+      - "8084:8083"
+    environment:
+      # — your existing CONNECT_* settings —
+      CONNECT_BOOTSTRAP_SERVERS: "kafka_primary:9092,kafka_secondary:9092"
+      CONNECT_GROUP_ID: "kafka-connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "kafka-connect-configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "kafka-connect-offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "kafka-connect-status"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+
+      CONNECT_REST_HOST_NAME: "0.0.0.0"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka_connect_instance"
+      CONNECT_REST_LISTENERS: "http://0.0.0.0:8083"
+      CONNECT_REST_ADVERTISED_LISTENERS: "http://kafka_connect_instance:8083"
+
+    volumes:
+      - ./connectors:/etc/connectors:ro
+    command:
+      - bash
+      - -c
+      - |
+        echo "Installing necessary connectors..."
+        confluent-hub install --no-prompt debezium/debezium-connector-postgresql:1.9.7
+        confluent-hub install --no-prompt confluentinc/kafka-connect-hdfs3:1.1.18
+        echo "Starting Kafka Connect..."
+        /etc/confluent/docker/run
+    depends_on:
+      - kafka_broker1
+      - kafka_broker2
+      - db_service
+      - hdfs_namenode
+    networks:
+      - data_pipeline_net
+
+
+  # Hadoop NameNode (for HDFS storage)
+  hdfs_namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    restart: unless-stopped
+    environment:
+      - CLUSTER_NAME=hadoop_cluster
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HDFS_CONF_dfs_replication=3
+    ports:
+      - "9871:9870"
+    networks:
+      - data_pipeline_net
+    volumes:
+      - namenode_storage:/hadoop/dfs/name
+
+  # Hadoop DataNodes
+  hdfs_datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode_1
+    restart: unless-stopped
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HDFS_CONF_dfs_datanode_data_dir=/hadoop/dfs/data
+    depends_on:
+      - hdfs_namenode
+    networks:
+      - data_pipeline_net
+    volumes:
+      - datanode1_storage:/hadoop/dfs/data
+
+  hdfs_datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode_2
+    hostname: datanode2
+    restart: unless-stopped
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HDFS_CONF_dfs_datanode_data_dir=/hadoop/dfs/data
+    depends_on:
+      - hdfs_namenode
+    networks:
+      - data_pipeline_net
+    volumes:
+      - datanode2_storage:/hadoop/dfs/data
+
+# _________________________________
+#  SINK : single append-only file.
+# _________________________________
+  file_sink:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka_file_sink
+    user: root
+    depends_on:
+      - kafka_broker1
+    command:
+      - sh
+      - -c
+      - |
+        echo '📡 Listening for changes...';
+        # wait for the broker to be up
+        until nc -z kafka_primary 9092; do sleep 3; done
+        # then consume continuously
+        kafka-console-consumer \
+          --bootstrap-server kafka_primary:9092 \
+          --topic postgres.public.orders \
+          --from-beginning \
+          --property print.value=true \
+          >> /sink/changes.json
+    volumes:
+      - ./sink:/sink:rw
+    networks:
+      - data_pipeline_net
+
+
+#----------------------------
+  # Test Generator    
+# --------------------------
+  test:
+    image: python:3.12-slim
+    container_name: cdc_test_runner
+    depends_on:
+      - db_service
+    networks:
+      - data_pipeline_net # ✅ <-- as part of the pipeline
+    volumes:
+      - .:/app
+      - ./sink:/app/sink  
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - |
+        pip install psycopg2-binary &&
+        python cdc_test_generator.py
+
+
+# -----------------------------
+# Airflow (DAG Workflow)       
+# ----------------------------
+  airflow:
+    image: apache/airflow:2.5.3   
+    container_name: airflow              
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__FERNET_KEY: X8JLtEFx53xx6pvDILiJVa_YUZFvI6MrD2BoNpkPKIU=
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose.yml:/opt/airflow/docker-compose.yml:ro
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+        airflow db init &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+        # Start the scheduler in the background, logging to scheduler.log
+        nohup airflow scheduler > /opt/airflow/logs/scheduler.log 2>&1 & 
+        # Then replace this shell with the webserver
+        exec airflow webserver
+      "
+    depends_on:
+      - kafka_broker1       
+      - kafka_broker2       
+      - db_service
+      - hdfs_namenode
+      - kafka_connect
+      - file_sink
+
+
+# Define storage volumes
+volumes:
+  postgres_storage:
+  zookeeper_storage:
+  zk_logs:
+  kafka_primary_storage:
+  kafka_secondary_storage:
+  namenode_storage:
+  datanode1_storage:
+  datanode2_storage:
+
+# Define custom network
+networks:
+  data_pipeline_net:
+    driver: bridge

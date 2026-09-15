@@ -1,0 +1,9 @@
+[
+    {
+        "order_id": 6,
+        "customer_name": "Dr. Mhammecd Chraibi",
+        "product": "Rolls Royce Car",
+        "quantity": 10,
+        "order_status": "Delivered"
+    }
+]

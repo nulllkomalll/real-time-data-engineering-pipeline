@@ -1,0 +1,16 @@
+[
+    {
+        "order_id": 1,
+        "customer_name": "Youness Khayour",
+        "product": "Laptop",
+        "quantity": 1,
+        "order_status": "Delivered"
+    },
+    {
+        "order_id": 3,
+        "customer_name": "Dr. Amine Bensaid",
+        "product": "Desk",
+        "quantity": 1,
+        "order_status": "Delivered"
+    }
+]
